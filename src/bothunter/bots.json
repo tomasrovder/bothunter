@@ -14,6 +14,8 @@
     { "name": "SemrushBot", "user_agent_pattern": "%SemrushBot%" },
     { "name": "DotBot", "user_agent_pattern": "%DotBot%" },
     { "name": "PerplexityBot", "user_agent_pattern": "%PerplexityBot%" },
-    { "name": "CCBot", "user_agent_pattern": "%CCBot%" }
+    { "name": "CCBot", "user_agent_pattern": "%CCBot%" },
+    { "name": "Claude-User", "user_agent_pattern": "%Claude-User%" },
+    { "name": "Google-Agent", "user_agent_pattern": "%Google-Agent%" }
   ]
 }
