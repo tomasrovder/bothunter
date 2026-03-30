@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bothunter"
+version = "1.0.0"
+description = "AI bot crawl report CLI — coverage and blocking analysis via Cloudflare Analytics"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "python-dotenv",
+]
+
+[project.scripts]
+bothunter = "bothunter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bothunter = ["bots.json"]
