@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from xml.etree import ElementTree
@@ -157,7 +158,18 @@ def _date_chunks(date_start, date_end):
         chunk_start = chunk_end + timedelta(days=1)
 
 
-def _query_cloudflare_single_chunk(headers, zone_id, chunk_start, chunk_end,
+def _make_session(auth_email, auth_key):
+    """Create a requests.Session with Cloudflare auth headers pre-configured."""
+    session = requests.Session()
+    session.headers.update({
+        "X-Auth-Email": auth_email,
+        "X-Auth-Key": auth_key,
+        "Content-Type": "application/json",
+    })
+    return session
+
+
+def _query_cloudflare_single_chunk(session, zone_id, chunk_start, chunk_end,
                                     user_agent_pattern, status_filter, delay):
     """Query a single date chunk with pagination. Returns (host, path) -> count dict."""
     hit_counts = {}
@@ -204,10 +216,9 @@ def _query_cloudflare_single_chunk(headers, zone_id, chunk_start, chunk_end,
         resp = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                resp = requests.post(
+                resp = session.post(
                     CLOUDFLARE_GRAPHQL_URL,
                     json={"query": query},
-                    headers=headers,
                     timeout=60,
                 )
                 if resp.status_code == 429 or resp.status_code >= 500:
@@ -258,6 +269,149 @@ def _query_cloudflare_single_chunk(headers, zone_id, chunk_start, chunk_end,
     return hit_counts
 
 
+def _query_cloudflare_combined_chunk(session, zone_id, chunk_start, chunk_end,
+                                      user_agent_pattern, delay):
+    """Query a single date chunk with pagination, returning total+blocked counts.
+
+    Adds edgeResponseStatus to dimensions so we can split total/blocked (403)
+    from a single query instead of making two separate queries.
+
+    Returns dict of (host, path) -> {"total": N, "blocked": N}.
+    """
+    combined = {}
+    cursor = None
+
+    for page in range(1, MAX_PAGES + 1):
+        filter_parts = [
+            f'date_geq: "{chunk_start}"',
+            f'date_leq: "{chunk_end}"',
+            f'userAgent_like: "{user_agent_pattern}"',
+        ]
+        if cursor is not None:
+            filter_parts.append(f'datetime_lt: "{cursor}"')
+
+        filter_str = "\n              ".join(filter_parts)
+
+        query = f"""
+        query {{
+          viewer {{
+            zones(filter: {{ zoneTag: "{zone_id}" }}) {{
+              httpRequestsAdaptiveGroups(
+                filter: {{
+                  {filter_str}
+                }}
+                limit: {PAGE_LIMIT}
+                orderBy: [datetime_DESC]
+              ) {{
+                count
+                dimensions {{
+                  clientRequestPath
+                  clientRequestHTTPHost
+                  edgeResponseStatus
+                  datetime
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
+
+        resp = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = session.post(
+                    CLOUDFLARE_GRAPHQL_URL,
+                    json={"query": query},
+                    timeout=60,
+                )
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    wait = 2 ** attempt
+                    print(f"    HTTP {resp.status_code}, retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == MAX_RETRIES:
+                    raise
+                wait = 2 ** attempt
+                print(f"    Request error: {e}, retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(wait)
+
+        data = resp.json()
+
+        if data.get("errors"):
+            print("Cloudflare API errors:", file=sys.stderr)
+            for err in data["errors"]:
+                print(f"  {err.get('message', err)}", file=sys.stderr)
+            sys.exit(1)
+
+        zones = data.get("data", {}).get("viewer", {}).get("zones", [])
+        if not zones:
+            print("No zone data returned. Check your CLOUDFLARE_ZONE_ID.", file=sys.stderr)
+            sys.exit(1)
+
+        groups = zones[0].get("httpRequestsAdaptiveGroups", [])
+
+        for group in groups:
+            dims = group["dimensions"]
+            host = dims["clientRequestHTTPHost"]
+            path = dims["clientRequestPath"]
+            status = dims["edgeResponseStatus"]
+            count = group["count"]
+            key = (host, path)
+            if key not in combined:
+                combined[key] = {"total": 0, "blocked": 0}
+            combined[key]["total"] += count
+            if status == 403:
+                combined[key]["blocked"] += count
+
+        if len(groups) < PAGE_LIMIT:
+            break
+
+        cursor = groups[-1]["dimensions"]["datetime"]
+
+        if page < MAX_PAGES:
+            time.sleep(delay)
+
+    return combined
+
+
+def query_bot_combined_stats(session, zone_id, date_start, date_end,
+                              bot_name, user_agent_pattern, delay=0.2):
+    """Query total + blocked traffic for a bot in a single paginated pass.
+
+    Returns dict of (host, path) -> {"total": N, "blocked": N}.
+    """
+    print(f"  Querying traffic for {bot_name}...")
+
+    chunks = list(_date_chunks(date_start, date_end))
+    if len(chunks) > 1:
+        print(f"    Date range split into {len(chunks)} weekly chunks")
+
+    combined = {}
+    for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            print(f"    Chunk {i}/{len(chunks)}: {chunk_start} to {chunk_end}")
+
+        chunk_combined = _query_cloudflare_combined_chunk(
+            session, zone_id, chunk_start, chunk_end,
+            user_agent_pattern, delay,
+        )
+
+        for key, stats in chunk_combined.items():
+            if key not in combined:
+                combined[key] = {"total": 0, "blocked": 0}
+            combined[key]["total"] += stats["total"]
+            combined[key]["blocked"] += stats["blocked"]
+
+    total = sum(s["total"] for s in combined.values())
+    blocked = sum(s["blocked"] for s in combined.values())
+    print(f"    Traffic: {total:,} total, {blocked:,} blocked across {len(combined)} URLs")
+
+    return combined
+
+
 def query_cloudflare_paginated(auth_email, auth_key, zone_id, date_start, date_end,
                                 user_agent_pattern, status_filter=None, delay=1.0):
     """Query Cloudflare httpRequestsAdaptiveGroups with pagination and date chunking.
@@ -267,11 +421,7 @@ def query_cloudflare_paginated(auth_email, auth_key, zone_id, date_start, date_e
 
     Returns a dict mapping (host, path) -> total_count.
     """
-    headers = {
-        "X-Auth-Email": auth_email,
-        "X-Auth-Key": auth_key,
-        "Content-Type": "application/json",
-    }
+    session = _make_session(auth_email, auth_key)
 
     chunks = list(_date_chunks(date_start, date_end))
     if len(chunks) > 1:
@@ -283,7 +433,7 @@ def query_cloudflare_paginated(auth_email, auth_key, zone_id, date_start, date_e
             print(f"    Chunk {i}/{len(chunks)}: {chunk_start} to {chunk_end}")
 
         chunk_hits = _query_cloudflare_single_chunk(
-            headers, zone_id, chunk_start, chunk_end,
+            session, zone_id, chunk_start, chunk_end,
             user_agent_pattern, status_filter, delay,
         )
 
@@ -298,6 +448,7 @@ def query_bot_blocking_stats(auth_email, auth_key, zone_id, date_start, date_end
     """Query all traffic and blocked (403) traffic for a single bot.
 
     Returns (all_hits, blocked_hits) — both dicts of (host, path) -> count.
+    Note: kept for backward compatibility with coverage-report.
     """
     print(f"  Querying all traffic for {bot_name}...")
     all_hits = query_cloudflare_paginated(
@@ -471,40 +622,67 @@ def generate_blocked_report(results, bots, zones, date_start, date_end, output_p
     print(f"Report saved to:    {output_path}")
 
 
+def _query_single_bot(auth_email, auth_key, zone_id, date_start, date_end,
+                       bot, delay):
+    """Query a single bot's combined stats. Thread-safe (own session per call).
+
+    Returns (bot_name, combined_dict).
+    """
+    bot_name = bot["name"]
+    pattern = bot["user_agent_pattern"]
+    session = _make_session(auth_email, auth_key)
+
+    combined = query_bot_combined_stats(
+        session, zone_id, date_start, date_end,
+        bot_name, pattern, delay=delay,
+    )
+    return bot_name, combined
+
+
 def run_blocked_report(auth_email, auth_key, zones, date_start, date_end,
-                        bots_config, delay):
-    """Orchestrate the blocked-report: query all bots across all zones and generate report."""
+                        bots_config, delay, workers=4):
+    """Orchestrate the blocked-report: query all bots across all zones and generate report.
+
+    Uses ThreadPoolExecutor to query bots in parallel within each zone.
+    Each bot query gets its own requests.Session for thread safety.
+    """
     bots = bots_config["bots"]
     results = {}  # (zone_name, full_url) -> {bot_name -> {"total": N, "blocked": N}}
 
     for zi, zone in enumerate(zones, 1):
         zone_name = zone["name"]
         zone_id = zone["id"]
+
         print(f"\n{'='*60}")
         print(f"Zone [{zi}/{len(zones)}]: {zone_name}")
         print(f"{'='*60}")
 
-        for i, bot in enumerate(bots, 1):
-            bot_name = bot["name"]
-            pattern = bot["user_agent_pattern"]
-            print(f"\n[{i}/{len(bots)}] Processing {bot_name}...")
+        effective_workers = min(workers, len(bots))
+        print(f"Querying {len(bots)} bots with {effective_workers} parallel workers")
 
-            all_hits, blocked_hits = query_bot_blocking_stats(
-                auth_email, auth_key, zone_id, date_start, date_end,
-                bot_name, pattern, delay=delay,
-            )
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {}
+            for bot in bots:
+                future = executor.submit(
+                    _query_single_bot, auth_email, auth_key, zone_id,
+                    date_start, date_end, bot, delay,
+                )
+                futures[future] = bot["name"]
 
-            # Merge into results
-            all_keys = set(all_hits.keys()) | set(blocked_hits.keys())
-            for host, path in all_keys:
-                full_url = f"https://{host}{path}".rstrip("/")
-                key = (zone_name, full_url)
-                if key not in results:
-                    results[key] = {}
-                results[key][bot_name] = {
-                    "total": all_hits.get((host, path), 0),
-                    "blocked": blocked_hits.get((host, path), 0),
-                }
+            for future in as_completed(futures):
+                bot_name = futures[future]
+                try:
+                    _, combined = future.result()
+                except Exception as e:
+                    print(f"\nError querying {bot_name}: {e}", file=sys.stderr)
+                    raise
+
+                for (host, path), stats in combined.items():
+                    full_url = f"https://{host}{path}".rstrip("/")
+                    key = (zone_name, full_url)
+                    if key not in results:
+                        results[key] = {}
+                    results[key][bot_name] = stats
 
     # Generate report
     output_dir = Path.home() / "Downloads"
@@ -653,7 +831,7 @@ def main():
   bothunter blocked-report                           Yesterday, all zones
   bothunter blocked-report --zone sk                 Yesterday, SK zone only
   bothunter blocked-report --period week --zone cz   Last 7 days, CZ zone only
-  bothunter blocked-report --period month --delay 1  Last 30 days, all zones
+  bothunter blocked-report --period month --workers 8 Last 30 days, 8 parallel zones
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -671,13 +849,19 @@ def main():
     blocked_parser.add_argument(
         "--delay",
         type=float,
-        default=1.0,
-        help="Delay in seconds between paginated API requests (default: 1.0)",
+        default=0.2,
+        help="Delay in seconds between paginated API requests (default: 0.2)",
     )
     blocked_parser.add_argument(
         "--zone",
         default=None,
         help="Run only for a single zone (e.g. --zone sk). Must match a CLOUDFLARE_ZONE_ID_* suffix.",
+    )
+    blocked_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of zones to process in parallel (default: 4)",
     )
 
     args = parser.parse_args()
@@ -729,7 +913,7 @@ def main():
         bots_config = load_bots_config(bots_file)
         run_blocked_report(
             auth_email, auth_key, zones, date_start, date_end,
-            bots_config, args.delay,
+            bots_config, args.delay, workers=args.workers,
         )
 
 

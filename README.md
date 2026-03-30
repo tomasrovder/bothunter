@@ -4,22 +4,29 @@ AI bot crawl report CLI — coverage and blocking analysis via Cloudflare Analyt
 
 ## Installation
 
-```bash
-# Install pipx (if not installed)
-brew install pipx
-pipx ensurepath
+If you previously installed via pipx, remove it first:
 
-# Install BotHunter
-pipx install git+https://github.com/tomasrovder/bothunter.git
+```bash
+pipx uninstall bothunter
 ```
 
-To install from a local clone:
+Then install from source:
 
 ```bash
 git clone https://github.com/tomasrovder/bothunter.git
 cd bothunter
-pipx install .
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
 ```
+
+To make `bothunter` available globally (from any directory), add the venv to your PATH in `~/.zshrc`:
+
+```bash
+export PATH="/path/to/bothunter/venv/bin:$PATH"
+```
+
+Then reload your shell with `source ~/.zshrc`.
 
 ## Configuration
 
@@ -51,8 +58,8 @@ bothunter coverage-report --zone sk --period week
 # Bot blocking stats (yesterday, all zones)
 bothunter blocked-report
 
-# Blocking stats for a single zone, last 30 days
-bothunter blocked-report --zone sk --period month --delay 0.5
+# Blocking stats for a single zone, last 30 days, 8 parallel workers
+bothunter blocked-report --zone sk --period month --workers 8
 ```
 
 ### Commands
@@ -68,7 +75,8 @@ bothunter blocked-report --zone sk --period month --delay 0.5
 |---|---|---|---|
 | `--period` | `day`, `week`, `month` | `day` | Time range: yesterday, last 7 days, or last 30 days |
 | `--zone` | zone suffix | all zones | Run for a single zone (e.g. `--zone sk`) |
-| `--delay` | seconds | `1.0` | Delay between API requests (blocked-report only) |
+| `--delay` | seconds | `0.2` | Delay between API requests (blocked-report only) |
+| `--workers` | integer | `4` | Number of bots to query in parallel (blocked-report only) |
 | `--bots-file` | path | `bots.json` | Custom bot config file (blocked-report only) |
 
 ## Tracked Bots
